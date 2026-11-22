@@ -15,6 +15,7 @@ let persistInterval: TimeInterval = 30  // seconds between writes to disk
 let settleDelay: TimeInterval = 2       // wait after a display change before restoring
 let scaleOnScreenMove = true            // resize windows moved to another display to the same fraction of it
 let ignoredBundleIDs: Set<String> = []  // e.g. ["com.apple.systempreferences"]
+let forgetAfterDays: Double = 30        // drop saved windows not seen for this long
 
 let storeURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/WindowMemory/layouts.json")
@@ -31,11 +32,59 @@ func log(_ items: Any...) {
 struct WinInfo: Codable {
     var screen: String?   // display UUID; nil = "whatever screen the window is on now"
     var x, y, w, h: Double
+    var seen: Double?     // when this was last recorded (seconds since 1970)
 }
 
 struct Layout: Codable {
     var byId: [String: WinInfo] = [:]     // CGWindowID -> info (valid within one login session)
-    var byTitle: [String: WinInfo] = [:]  // "bundleID|title" -> info (survives app relaunches)
+    var byTitle: [String: WinInfo] = [:]  // "bundleID|title" -> info, only for titles one window had
+    var byApp: [String: WinInfo] = [:]    // bundleID -> info, only for apps with a single window
+
+    init() {}
+
+    // Layouts saved before byApp existed have no such key.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        byId = try c.decodeIfPresent([String: WinInfo].self, forKey: .byId) ?? [:]
+        byTitle = try c.decodeIfPresent([String: WinInfo].self, forKey: .byTitle) ?? [:]
+        byApp = try c.decodeIfPresent([String: WinInfo].self, forKey: .byApp) ?? [:]
+    }
+
+    /// Drops entries last seen before `cutoff`. Entries saved before `seen`
+    /// existed get stamped `now`, so they expire on the same schedule.
+    mutating func prune(before cutoff: Double, now: Double) {
+        func prune(_ map: inout [String: WinInfo]) {
+            for (key, info) in map {
+                if let seen = info.seen {
+                    if seen < cutoff { map[key] = nil }
+                } else {
+                    map[key]?.seen = now
+                }
+            }
+        }
+        prune(&byId)
+        prune(&byTitle)
+        prune(&byApp)
+    }
+}
+
+/// Which saved keys can be trusted, given every window open right now.
+struct MatchContext {
+    private var titleCounts: [String: Int] = [:]
+    private var appCounts: [String: Int] = [:]
+
+    init(_ windows: [Win]) {
+        for w in windows {
+            titleCounts[w.titleKey, default: 0] += 1
+            appCounts[w.bundleID, default: 0] += 1
+        }
+    }
+
+    /// The window has a title and no other open window of its app shares it.
+    func titleIsUnique(_ w: Win) -> Bool { !w.title.isEmpty && titleCounts[w.titleKey] == 1 }
+
+    /// The window is its app's only open window.
+    func isSoleWindow(_ w: Win) -> Bool { appCounts[w.bundleID] == 1 }
 }
 
 struct Store: Codable {
@@ -265,6 +314,10 @@ final class WindowMemory: NSObject, NSMenuDelegate {
     }
 
     func save() {
+        let now = Date().timeIntervalSince1970
+        for key in store.layouts.keys {
+            store.layouts[key]?.prune(before: now - forgetAfterDays * 86_400, now: now)
+        }
         do {
             try FileManager.default.createDirectory(at: storeURL.deletingLastPathComponent(),
                                                     withIntermediateDirectories: true)
@@ -286,7 +339,10 @@ final class WindowMemory: NSObject, NSMenuDelegate {
         guard setupUnchanged(screens) else { return }
 
         var layout = store.layouts[currentConfig] ?? Layout()
-        for w in listWindows() where pending[w.pendingKey] == nil {
+        let windows = listWindows()
+        let context = MatchContext(windows)
+        let now = Date().timeIntervalSince1970
+        for w in windows where pending[w.pendingKey] == nil {
             guard let s = screen(for: w.frame, in: screens) else { continue }
             var frame = w.frame
             // Moved to another display since the last snapshot (by you or by
@@ -303,9 +359,14 @@ final class WindowMemory: NSObject, NSMenuDelegate {
                                x: (frame.minX - s.frame.minX) / s.frame.width,
                                y: (frame.minY - s.frame.minY) / s.frame.height,
                                w: frame.width / s.frame.width,
-                               h: frame.height / s.frame.height)
+                               h: frame.height / s.frame.height,
+                               seen: now)
             if let id = w.idKey { layout.byId[id] = info }
-            layout.byTitle[w.titleKey] = info
+            // Shared or empty titles would hand one window's frame to another.
+            if context.titleIsUnique(w) { layout.byTitle[w.titleKey] = info }
+            // Lets a lone window be found again when its title keeps changing
+            // (browser tabs, documents).
+            if context.isSoleWindow(w) { layout.byApp[w.bundleID] = info }
         }
         // Reading every window takes a moment; if the displays started changing
         // meanwhile, some of these frames may already be shuffled. Drop them all.
@@ -319,10 +380,12 @@ final class WindowMemory: NSObject, NSMenuDelegate {
 
     // MARK: Restore
 
-    private func lookup(_ layout: Layout?, _ w: Win) -> WinInfo? {
+    private func lookup(_ layout: Layout?, _ w: Win, _ context: MatchContext) -> WinInfo? {
         guard let layout else { return nil }
         if let id = w.idKey, let info = layout.byId[id] { return info }
-        return layout.byTitle[w.titleKey]
+        if context.titleIsUnique(w), let info = layout.byTitle[w.titleKey] { return info }
+        if context.isSoleWindow(w), let info = layout.byApp[w.bundleID] { return info }
+        return nil
     }
 
     /// `old`'s size as a fraction of `s`, kept where the window was dropped but
@@ -365,9 +428,11 @@ final class WindowMemory: NSObject, NSMenuDelegate {
         pending = [:]
         var count = 0
 
-        for w in listWindows() {
-            var info = lookup(layout, w)
-            if info == nil, var p = lookup(prevLayout, w) {
+        let windows = listWindows()
+        let context = MatchContext(windows)
+        for w in windows {
+            var info = lookup(layout, w, context)
+            if info == nil, var p = lookup(prevLayout, w, context) {
                 p.screen = nil   // scale onto whichever screen it's on now
                 info = p
             }
