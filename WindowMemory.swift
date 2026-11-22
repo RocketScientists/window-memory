@@ -246,13 +246,23 @@ func isAccessibilityTrusted(prompt: Bool) -> Bool {
 
 // MARK: - Window memory
 
+/// A restore that macOS ignored, typically because the window sits in a
+/// background Stage Manager stage. Retried until it takes or runs out of tries.
+struct PendingRestore {
+    let info: WinInfo
+    var attempts = 0
+}
+
+let maxRestoreAttempts = 5
+let activationRetryDelays: [TimeInterval] = [0.5, 1.5]   // after the stage-switch animation
+
 final class WindowMemory: NSObject, NSMenuDelegate {
     private var store = Store()
     private var currentConfig = configKey()
     private var currentLiveConfig = liveConfigKey()
     private var configBeforeChange: String?
     private var paused = false
-    private var pending: [String: WinInfo] = [:]   // restores to re-apply when the app activates
+    private var pending: [String: PendingRestore] = [:]   // restores that didn't take yet
     private var settleWork: DispatchWorkItem?
     private var timers: [Timer] = []
     private var statusItem: NSStatusItem!
@@ -286,7 +296,13 @@ final class WindowMemory: NSObject, NSMenuDelegate {
         }, Unmanaged.passUnretained(self).toOpaque())
 
         timers.append(Timer.scheduledTimer(withTimeInterval: saveInterval, repeats: true) { [weak self] _ in
-            self?.snapshot()
+            guard let self else { return }
+            // The app in front never gets an activation event, so retry its
+            // pending restores here.
+            if let front = NSWorkspace.shared.frontmostApplication {
+                self.retryPending(pid: front.processIdentifier)
+            }
+            self.snapshot()
         })
         timers.append(Timer.scheduledTimer(withTimeInterval: persistInterval, repeats: true) { [weak self] _ in
             self?.save()
@@ -457,7 +473,7 @@ final class WindowMemory: NSObject, NSMenuDelegate {
             count += 1
             // Stage Manager may ignore moves for windows in background stages;
             // retry those when their app is activated.
-            if !apply(info, to: w, screens) { pending[w.pendingKey] = info }
+            if !apply(info, to: w, screens) { pending[w.pendingKey] = PendingRestore(info: info) }
         }
         return count
     }
@@ -499,13 +515,31 @@ final class WindowMemory: NSObject, NSMenuDelegate {
               let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
         else { return }
         let pid = app.processIdentifier
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self else { return }
-            let screens = currentScreens()
-            for w in listWindows(pid: pid) {
-                if let info = self.pending.removeValue(forKey: w.pendingKey) {
-                    self.apply(info, to: w, screens)
-                }
+        // Its stage is sliding in; try once the animation is likely done, and
+        // again in case it was slow.
+        for delay in activationRetryDelays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.retryPending(pid: pid)
+            }
+        }
+    }
+
+    /// Re-applies the pending restores for one app's windows. A restore is
+    /// dropped once it takes, or after `maxRestoreAttempts` tries, so a window
+    /// the app won't let us resize isn't fought over forever.
+    private func retryPending(pid: pid_t) {
+        guard !paused, !pending.isEmpty else { return }
+        let screens = currentScreens()
+        for w in listWindows(pid: pid) {
+            guard var restore = pending[w.pendingKey] else { continue }
+            restore.attempts += 1
+            if apply(restore.info, to: w, screens) {
+                pending[w.pendingKey] = nil
+            } else if restore.attempts >= maxRestoreAttempts {
+                pending[w.pendingKey] = nil
+                log("gave up restoring a", w.bundleID, "window after", restore.attempts, "tries")
+            } else {
+                pending[w.pendingKey] = restore
             }
         }
     }
