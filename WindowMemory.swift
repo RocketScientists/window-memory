@@ -67,6 +67,23 @@ func configKey(_ screens: [ScreenInfo] = currentScreens()) -> String {
     screens.map(\.uuid).sorted().joined(separator: "+")
 }
 
+/// The display setup as the WindowServer reports it right now. NSScreen.screens
+/// is AppKit's cached copy and only updates once the main run loop handles the
+/// change, so it can lag behind macOS moving windows. Only compare this with an
+/// earlier value of itself.
+func liveConfigKey() -> String {
+    var count: UInt32 = 0
+    guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return "" }
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+    guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return "" }
+    return ids.prefix(Int(count))
+        .filter { CGDisplayMirrorsDisplay($0) == kCGNullDirectDisplay }
+        .compactMap { CGDisplayCreateUUIDFromDisplayID($0)?.takeRetainedValue() }
+        .map { CFUUIDCreateString(nil, $0) as String }
+        .sorted()
+        .joined(separator: "+")
+}
+
 func screen(for rect: CGRect, in screens: [ScreenInfo]) -> ScreenInfo? {
     let best = screens.max { a, b in
         let ia = a.frame.intersection(rect), ib = b.frame.intersection(rect)
@@ -172,6 +189,7 @@ func isAccessibilityTrusted(prompt: Bool) -> Bool {
 final class WindowMemory: NSObject, NSMenuDelegate {
     private var store = Store()
     private var currentConfig = configKey()
+    private var currentLiveConfig = liveConfigKey()
     private var configBeforeChange: String?
     private var paused = false
     private var pending: [String: WinInfo] = [:]   // restores to re-apply when the app activates
@@ -191,6 +209,21 @@ final class WindowMemory: NSObject, NSMenuDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(appActivated(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
+
+        // The WindowServer calls this before it reconfigures the displays (and
+        // so before it moves any windows), which lets us stop saving in time.
+        CGDisplayRegisterReconfigurationCallback({ _, flags, userInfo in
+            guard let userInfo else { return }
+            let memory = Unmanaged<WindowMemory>.fromOpaque(userInfo).takeUnretainedValue()
+            let handle = {
+                if flags.contains(.beginConfigurationFlag) {
+                    memory.beginDisplayChange()
+                } else {
+                    memory.screensChanged()
+                }
+            }
+            if Thread.isMainThread { handle() } else { DispatchQueue.main.sync(execute: handle) }
+        }, Unmanaged.passUnretained(self).toOpaque())
 
         timers.append(Timer.scheduledTimer(withTimeInterval: saveInterval, repeats: true) { [weak self] _ in
             self?.snapshot()
@@ -236,9 +269,9 @@ final class WindowMemory: NSObject, NSMenuDelegate {
     func snapshot() {
         guard !paused else { return }
         let screens = currentScreens()
-        // Displays changed but the notification hasn't arrived yet: don't record
-        // the positions macOS just shuffled around.
-        guard configKey(screens) == currentConfig else { return }
+        // Displays changed but we haven't been told yet: don't record the
+        // positions macOS just shuffled around.
+        guard setupUnchanged(screens) else { return }
 
         var layout = store.layouts[currentConfig] ?? Layout()
         for w in listWindows() where pending[w.pendingKey] == nil {
@@ -251,7 +284,14 @@ final class WindowMemory: NSObject, NSMenuDelegate {
             if let id = w.idKey { layout.byId[id] = info }
             layout.byTitle[w.titleKey] = info
         }
+        // Reading every window takes a moment; if the displays started changing
+        // meanwhile, some of these frames may already be shuffled. Drop them all.
+        guard !paused, setupUnchanged(screens) else { return }
         store.layouts[currentConfig] = layout
+    }
+
+    private func setupUnchanged(_ screens: [ScreenInfo]) -> Bool {
+        configKey(screens) == currentConfig && liveConfigKey() == currentLiveConfig
     }
 
     // MARK: Restore
@@ -309,13 +349,17 @@ final class WindowMemory: NSObject, NSMenuDelegate {
 
     // MARK: Events
 
-    @objc private func screensChanged() {
-        if configKey() == currentConfig && !paused { return }
-        if !paused {
-            paused = true
-            configBeforeChange = currentConfig
-            save()
-        }
+    /// Stops saving until the display change has settled. Safe to call repeatedly.
+    fileprivate func beginDisplayChange() {
+        guard !paused else { return }
+        paused = true
+        configBeforeChange = currentConfig
+        save()
+    }
+
+    @objc fileprivate func screensChanged() {
+        if !paused && configKey() == currentConfig && liveConfigKey() == currentLiveConfig { return }
+        beginDisplayChange()
         // macOS often fires several notifications per change; act once it settles.
         settleWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.finishDisplayChange() }
@@ -325,6 +369,7 @@ final class WindowMemory: NSObject, NSMenuDelegate {
 
     private func finishDisplayChange() {
         currentConfig = configKey()
+        currentLiveConfig = liveConfigKey()
         let previous = configBeforeChange == currentConfig ? nil : configBeforeChange
         let hadLayout = store.layouts[currentConfig] != nil
         let n = restore(from: previous)
@@ -461,6 +506,7 @@ var hotKeyActions: [UInt32: () -> Void] = [:]
 if CommandLine.arguments.contains("--status") {
     let screens = currentScreens()
     print("Display setup:", configKey(screens))
+    print("WindowServer: ", liveConfigKey())
     for s in screens { print("  screen", s.uuid, s.frame) }
     print("Accessibility trusted:", isAccessibilityTrusted(prompt: false))
     if let data = try? Data(contentsOf: storeURL), let s = try? JSONDecoder().decode(Store.self, from: data) {
