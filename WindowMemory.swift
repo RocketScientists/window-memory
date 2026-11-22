@@ -13,6 +13,7 @@ import Carbon.HIToolbox
 let saveInterval: TimeInterval = 3      // seconds between snapshots
 let persistInterval: TimeInterval = 30  // seconds between writes to disk
 let settleDelay: TimeInterval = 2       // wait after a display change before restoring
+let scaleOnScreenMove = true            // resize windows moved to another display to the same fraction of it
 let ignoredBundleIDs: Set<String> = []  // e.g. ["com.apple.systempreferences"]
 
 let storeURL = FileManager.default.homeDirectoryForCurrentUser
@@ -268,6 +269,8 @@ final class WindowMemory: NSObject, NSMenuDelegate {
 
     func snapshot() {
         guard !paused else { return }
+        // A window may be mid-drag: don't record (or rescale) it until it's dropped.
+        guard NSEvent.pressedMouseButtons == 0 else { return }
         let screens = currentScreens()
         // Displays changed but we haven't been told yet: don't record the
         // positions macOS just shuffled around.
@@ -276,11 +279,22 @@ final class WindowMemory: NSObject, NSMenuDelegate {
         var layout = store.layouts[currentConfig] ?? Layout()
         for w in listWindows() where pending[w.pendingKey] == nil {
             guard let s = screen(for: w.frame, in: screens) else { continue }
+            var frame = w.frame
+            // Moved to another display since the last snapshot (by you or by
+            // Stage Manager): keep it the same fraction of the new display.
+            // Matched by window ID only, so a new window that merely shares a
+            // title is never resized.
+            if scaleOnScreenMove, let id = w.idKey, let old = layout.byId[id],
+               let from = old.screen, from != s.uuid, screens.contains(where: { $0.uuid == from }) {
+                let target = scaled(old, droppedAt: frame.origin, onto: s)
+                axSetFrame(w.element, target)
+                frame = axFrame(w.element) ?? target
+            }
             let info = WinInfo(screen: s.uuid,
-                               x: (w.frame.minX - s.frame.minX) / s.frame.width,
-                               y: (w.frame.minY - s.frame.minY) / s.frame.height,
-                               w: w.frame.width / s.frame.width,
-                               h: w.frame.height / s.frame.height)
+                               x: (frame.minX - s.frame.minX) / s.frame.width,
+                               y: (frame.minY - s.frame.minY) / s.frame.height,
+                               w: frame.width / s.frame.width,
+                               h: frame.height / s.frame.height)
             if let id = w.idKey { layout.byId[id] = info }
             layout.byTitle[w.titleKey] = info
         }
@@ -300,6 +314,16 @@ final class WindowMemory: NSObject, NSMenuDelegate {
         guard let layout else { return nil }
         if let id = w.idKey, let info = layout.byId[id] { return info }
         return layout.byTitle[w.titleKey]
+    }
+
+    /// `old`'s size as a fraction of `s`, kept where the window was dropped but
+    /// nudged so it fits on `s`.
+    private func scaled(_ old: WinInfo, droppedAt origin: CGPoint, onto s: ScreenInfo) -> CGRect {
+        let width = min(old.w * s.frame.width, s.frame.width)
+        let height = min(old.h * s.frame.height, s.frame.height)
+        let x = min(max(origin.x, s.frame.minX), s.frame.maxX - width)
+        let y = min(max(origin.y, s.frame.minY), s.frame.maxY - height)
+        return CGRect(x: x, y: y, width: width, height: height).integral
     }
 
     private func targetFrame(_ info: WinInfo, _ w: Win, _ screens: [ScreenInfo]) -> CGRect? {

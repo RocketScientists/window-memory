@@ -18,6 +18,7 @@ This builds `build/WindowMemory.app`, copies it to `~/Applications`, and registe
 - When the display setup changes, it waits 2 s for macOS to finish moving windows, then:
   - restores the saved layout for the new setup, if one exists, or
   - scales windows proportionally from the setup you just left (the first time you use a setup).
+- When a window moves to another display (you drag it there, or Stage Manager moves it), it's resized to the same fraction of that display, so it isn't tiny on the big screen or oversized on the laptop. It's kept where you dropped it. Set `scaleOnScreenMove = false` to turn this off.
 - Stage Manager: windows in background stages that ignore the move are restored again when their app is next activated.
 - Layouts are stored in `~/Library/Application Support/WindowMemory/layouts.json`.
 
