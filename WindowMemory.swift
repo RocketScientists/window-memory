@@ -14,6 +14,7 @@ let saveInterval: TimeInterval = 3      // seconds between snapshots
 let persistInterval: TimeInterval = 30  // seconds between writes to disk
 let settleDelay: TimeInterval = 2       // wait after a display change before restoring
 let scaleOnScreenMove = true            // resize windows moved to another display to the same fraction of it
+let restoreNewWindows = true            // give newly opened windows their saved frame, matched by title or app
 let ignoredBundleIDs: Set<String> = []  // e.g. ["com.apple.systempreferences"]
 let forgetAfterDays: Double = 30        // drop saved windows not seen for this long
 
@@ -343,13 +344,25 @@ final class WindowMemory: NSObject, NSMenuDelegate {
         let context = MatchContext(windows)
         let now = Date().timeIntervalSince1970
         for w in windows where pending[w.pendingKey] == nil {
-            guard let s = screen(for: w.frame, in: screens) else { continue }
             var frame = w.frame
+            guard var s = screen(for: frame, in: screens) else { continue }
+            if let id = w.idKey, layout.byId[id] == nil {
+                // First time we see this window in this setup and login: it was
+                // opened after the last restore, or we started after a reboot.
+                // Give it its saved frame, unless that would stack it exactly on
+                // another window of the same app.
+                if restoreNewWindows, let saved = lookup(layout, w, context),
+                   let target = targetFrame(saved, w, screens),
+                   !windows.contains(where: { $0.pid == w.pid && $0.idKey != id && nearlyEqual($0.frame, target) }) {
+                    axSetFrame(w.element, target)
+                    frame = axFrame(w.element) ?? target
+                    s = screen(for: frame, in: screens) ?? s
+                }
             // Moved to another display since the last snapshot (by you or by
             // Stage Manager): keep it the same fraction of the new display.
             // Matched by window ID only, so a new window that merely shares a
             // title is never resized.
-            if scaleOnScreenMove, let id = w.idKey, let old = layout.byId[id],
+            } else if scaleOnScreenMove, let id = w.idKey, let old = layout.byId[id],
                let from = old.screen, from != s.uuid, screens.contains(where: { $0.uuid == from }) {
                 let target = scaled(old, droppedAt: frame.origin, onto: s)
                 axSetFrame(w.element, target)
@@ -414,8 +427,12 @@ final class WindowMemory: NSObject, NSMenuDelegate {
         guard let target = targetFrame(info, w, screens) else { return true }
         axSetFrame(w.element, target)
         guard let now = axFrame(w.element) else { return false }
-        return abs(now.minX - target.minX) < 4 && abs(now.minY - target.minY) < 4
-            && abs(now.width - target.width) < 4 && abs(now.height - target.height) < 4
+        return nearlyEqual(now, target)
+    }
+
+    private func nearlyEqual(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.minX - b.minX) < 4 && abs(a.minY - b.minY) < 4
+            && abs(a.width - b.width) < 4 && abs(a.height - b.height) < 4
     }
 
     /// Restores the saved layout for the current display setup. Windows with no
