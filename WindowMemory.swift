@@ -39,7 +39,7 @@ struct Layout: Codable {
 }
 
 struct Store: Codable {
-    var bootTime: Double = 0
+    var session: String?                  // login session the byId entries belong to
     var layouts: [String: Layout] = [:]   // display-setup key -> layout
 }
 
@@ -181,6 +181,15 @@ func systemBootTime() -> Double {
     return Double(tv.tv_sec)
 }
 
+/// Identifies this boot and login session. Window IDs are only unique within
+/// one: the WindowServer starts numbering again after a logout, not just after
+/// a reboot. The audit session ID is new for every login.
+func loginSessionID() -> String {
+    var info = auditinfo_addr()
+    let asid = getaudit_addr(&info, Int32(MemoryLayout<auditinfo_addr>.size)) == 0 ? Int(info.ai_asid) : -1
+    return "\(Int(systemBootTime()))-\(asid)"
+}
+
 func isAccessibilityTrusted(prompt: Bool) -> Bool {
     AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": prompt] as CFDictionary)
 }
@@ -247,11 +256,11 @@ final class WindowMemory: NSObject, NSMenuDelegate {
            let s = try? JSONDecoder().decode(Store.self, from: data) {
             store = s
         }
-        // Window IDs are only meaningful within one boot; drop stale ones.
-        let boot = systemBootTime()
-        if store.bootTime != boot {
+        // Window IDs from an earlier login session may now belong to other windows.
+        let session = loginSessionID()
+        if store.session != session {
             for k in store.layouts.keys { store.layouts[k]?.byId = [:] }
-            store.bootTime = boot
+            store.session = session
         }
     }
 
